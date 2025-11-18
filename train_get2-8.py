@@ -18,7 +18,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANGPT_SCALE_INIT = 1
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -108,7 +108,7 @@ class GPT(nn.Module):
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
             std = 0.02
-            if hasattr(module, 'NANGPT_SCALE_INIT'):
+            if hasattr(module, 'NANOGPT_SCALE_INIT'):
                 std *= (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean = 0.0, std = std)
             if module.bias is not None:
@@ -242,28 +242,110 @@ class DataLoaderLite:
 model = GPT(GPTConfig())
 model.to(device)
 
-train_loader = DataLoaderLite(B = 4, T = 32)
+train_loader = DataLoaderLite(B = 16, T = 256)  # Increased batch size
 
-# NEW CODE
-optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4)
-for i in range(500):
+# OPTIMIZED TRAINING CODE
+max_lr = 6e-4  # Peak learning rate
+min_lr = max_lr * 0.1  # Minimum learning rate (10% of max)
+warmup_steps = 100  # Warmup steps
+max_steps = 10000  # Total training steps
+
+optimizer = torch.optim.AdamW(model.parameters(), lr = max_lr, weight_decay=0.1)
+
+# OneCycleLR scheduler for optimal learning rate scheduling
+scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    optimizer,
+    max_lr=max_lr,
+    total_steps=max_steps,
+    pct_start=0.05,  # 5% warmup
+    anneal_strategy='cos',
+    div_factor=25,  # Initial LR = max_lr/25
+    final_div_factor=100  # Final LR = max_lr/100
+)
+
+# Function to find the latest checkpoint
+def find_latest_checkpoint(checkpoint_dir='./trained_model'):
+    if not os.path.exists(checkpoint_dir):
+        return None
+
+    checkpoints = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_step_') and f.endswith('.pt')]
+    if not checkpoints:
+        return None
+
+    # Extract step numbers and find the maximum
+    steps = [int(f.split('_')[-1].split('.')[0]) for f in checkpoints]
+    latest_step = max(steps)
+    return os.path.join(checkpoint_dir, f'checkpoint_step_{latest_step}.pt')
+
+# Try to resume from checkpoint
+start_step = 0
+latest_checkpoint = find_latest_checkpoint()
+
+if latest_checkpoint and os.path.exists(latest_checkpoint):
+    print(f"Found checkpoint: {latest_checkpoint}")
+    checkpoint = torch.load(latest_checkpoint, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    start_step = checkpoint['step']
+    print(f"Resuming from step {start_step}, loss was {checkpoint['loss']:.4f}")
+else:
+    print("No checkpoint found, starting from scratch")
+
+print(f"Training from step {start_step} to {max_steps}")
+print(f"Max LR: {max_lr}, Min LR: {min_lr}")
+
+for step in range(start_step, max_steps):
+    t0 = time.time()
+
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
+
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
+
+    # Gradient clipping for stability
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
     optimizer.step()
-    print(f'step{i}, loss: {loss.item()}')
+    scheduler.step()
 
-print(f'Final loss: {loss.item()}')
+    t1 = time.time()
+    dt = (t1 - t0) * 1000  # time in ms
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
 
-# Save the model
+    # Log every 50 steps
+    if step % 50 == 0:
+        print(f'step {step:5d} | loss: {loss.item():.4f} | lr: {scheduler.get_last_lr()[0]:.2e} | dt: {dt:.2f}ms | tok/sec: {tokens_per_sec:.0f}')
+
+    # Save checkpoint every 500 steps
+    if step > 0 and step % 500 == 0:
+        checkpoint_path = os.path.join('./trained_model', f'checkpoint_step_{step}.pt')
+        torch.save({
+            'step': step,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'loss': loss.item(),
+        }, checkpoint_path)
+        print(f'Checkpoint saved at step {step}')
+
+    # Early stopping if loss < 0.99
+    if loss.item() < 0.099:
+        print(f'\nTarget loss achieved! Loss: {loss.item():.4f} at step {step}')
+        break
+
+print(f'\nFinal loss: {loss.item():.4f}')
+
+# Save the final model
 save_dir = './trained_model'
 os.makedirs(save_dir, exist_ok=True)
 
-# Save model state dict
-model_path = os.path.join(save_dir, 'model.pt')
+# Save final model state dict
+model_path = os.path.join(save_dir, 'model_final.pt')
 torch.save({
+    'step': step,
     'model_state_dict': model.state_dict(),
     'config': {
         'block_size': model.config.block_size,
@@ -273,9 +355,10 @@ torch.save({
         'n_embd': model.config.n_embd,
     },
     'optimizer_state_dict': optimizer.state_dict(),
+    'scheduler_state_dict': scheduler.state_dict(),
     'loss': loss.item(),
 }, model_path)
-print(f'Model saved to {model_path}')
+print(f'Final model saved to {model_path}')
 
 # Upload to Hugging Face
 try:
