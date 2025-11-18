@@ -1,7 +1,9 @@
 # Solving for residual std scaling issue
+import os
 import math
+import time
+import inspect
 from dataclasses import dataclass
-
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -120,7 +122,7 @@ class GPT(nn.Module):
         # idx is of shape (B, T)
         B, T = idx.size()
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
-        # forward the token and position embeddings
+        # forward the token and posisition embeddings
         pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (T, n_embd)
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
@@ -243,21 +245,91 @@ model.to(device)
 train_loader = DataLoaderLite(B = 4, T = 32)
 
 # NEW CODE
-optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-3)
-loss = 12
-i = 0
-while loss > 0.099999:
+optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4)
+for i in range(500):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f'step{i}, loss: {loss.item(): .4f}')
-    i = i + 1
+    print(f'step{i}, loss: {loss.item()}')
 
+print(f'Final loss: {loss.item()}')
 
-print(loss)
+# Save the model
+save_dir = './trained_model'
+os.makedirs(save_dir, exist_ok=True)
+
+# Save model state dict
+model_path = os.path.join(save_dir, 'model.pt')
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'config': {
+        'block_size': model.config.block_size,
+        'vocab_size': model.config.vocab_size,
+        'n_layer': model.config.n_layer,
+        'n_head': model.config.n_head,
+        'n_embd': model.config.n_embd,
+    },
+    'optimizer_state_dict': optimizer.state_dict(),
+    'loss': loss.item(),
+}, model_path)
+print(f'Model saved to {model_path}')
+
+# Upload to Hugging Face
+try:
+    from huggingface_hub import HfApi, create_repo
+
+    # Configuration - Update these values
+    HF_USERNAME = "agileabhi"  # Change this to your Hugging Face username
+    MODEL_NAME = "gpt_tokeniser"    # Change this to your desired model name
+
+    repo_id = f"{HF_USERNAME}/{MODEL_NAME}"
+
+    print(f"Uploading model to Hugging Face: {repo_id}")
+
+    # Create repo if it doesn't exist (will skip if it already exists)
+    try:
+        create_repo(repo_id, exist_ok=True, private=False)
+        print(f"Repository created/verified: {repo_id}")
+    except Exception as e:
+        print(f"Note: {e}")
+
+    # Upload the model files
+    api = HfApi()
+    api.upload_file(
+        path_or_fileobj=model_path,
+        path_in_repo="model.pt",
+        repo_id=repo_id,
+        repo_type="model",
+    )
+
+    # Create and upload a comprehensive README/Model Card
+    with open("./trained_model/readme.md", 'r') as f:
+        readme_content = f.read()
+
+    readme_path = os.path.join(save_dir, 'README.md')
+    with open(readme_path, 'w') as f:
+        f.write(readme_content)
+
+    api.upload_file(
+        path_or_fileobj=readme_path,
+        path_in_repo="README.md",
+        repo_id=repo_id,
+        repo_type="model",
+    )
+
+    print(f"Successfully uploaded model to: https://huggingface.co/{repo_id}")
+
+except ImportError:
+    print("huggingface_hub not installed. To upload to Hugging Face, install it with:")
+    print("pip install huggingface_hub")
+    print(f"Then run: huggingface-cli login")
+except Exception as e:
+    print(f"Error uploading to Hugging Face: {e}")
+    print("Make sure you're logged in with: huggingface-cli login")
+
 import sys; sys.exit(0)
 
 torch.manual_seed(42)
